@@ -32,10 +32,13 @@ def main(clip_model_type: str, data_path:'str', out_path: 'str', start_index: 'i
     print("%0d captions loaded from json " % len(data))
     
     checkpoint = load_checkpoint(out_path)
-    checkpoint_emb_shape = checkpoint['clip_embedding'].shape
+    if checkpoint :
+        checkpoint_emb_shape = checkpoint['clip_embedding'].shape
+    else:
+        checkpoint_emb_shape = None
     print(f'checkpoint shape: {checkpoint_emb_shape}')
 
-    all_embeddings = checkpoint['clip_embedding'] if checkpoint else []
+    all_embeddings = checkpoint['clip_embedding'] if checkpoint else None
     all_captions = checkpoint['captions'] if checkpoint else []
     new_embeddings = []
 
@@ -54,9 +57,14 @@ def main(clip_model_type: str, data_path:'str', out_path: 'str', start_index: 'i
         new_embeddings.append(prefix)
         all_captions.append(d)
         
+
+
         if (i + 1) % 10000 == 0:
             print(f'index {i} saved')
-            all_embeddings = torch.cat((all_embeddings, torch.cat(new_embeddings, dim=0)), dim=0)
+            if all_embeddings is not None :
+                all_embeddings = torch.cat((all_embeddings, torch.cat(new_embeddings, dim=0)), dim=0)
+            else:
+                all_embeddings = torch.cat(new_embeddings, dim=0) 
             new_embeddings = []
             with open(out_path, 'wb') as f:
                 pickle.dump({"clip_embedding": all_embeddings, "captions": all_captions}, f)
