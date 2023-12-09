@@ -217,6 +217,35 @@ class TransformerMapper(nn.Module):
         self.prefix_const = nn.Parameter(torch.randn(prefix_length, dim_embedding), requires_grad=True)
 
 
+
+class VectorQuantisation(nn.Module):
+    def __init__(self, word_embeddings):
+        super(VectorQuantisation, self).__init__()
+        self.word_embeddings = word_embeddings # word embedding shape (50527, gpt_emb_size)
+
+    def forward(self, prefix_projections):
+        prefix_projections_shape = prefix_projections.shape # B, prefix_length, gpt_emb_size
+    
+        # Flatten input
+        flatten = prefix_projections.reshape(-1, prefix_projections_shape[2])
+
+        distances = (torch.sum(flatten**2, dim=1, keepdim=True) 
+                    + torch.sum(self.word_embeddings**2, dim=1)
+                    - 2 * torch.matmul(flatten, self.word_embeddings.t()))
+        
+        
+        encoding_indices = torch.argmin(distances, dim=1)
+        VQ_prefix = self.word_embeddings[encoding_indices]
+        
+        VQ_prefix = VQ_prefix.reshape(prefix_projections_shape)
+
+        # preserve gradients
+        VQ_prefix = prefix_projections + (VQ_prefix - prefix_projections).detach()
+
+        return VQ_prefix
+
+
+
 class ClipCaptionModel(nn.Module):
 
     def get_dummy_token(self, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -226,6 +255,9 @@ class ClipCaptionModel(nn.Module):
                 labels: Optional[torch.Tensor] = None):
         embedding_text = self.gpt.transformer.wte(tokens)
         prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
+
+        prefix_projections = self.word_mapping(prefix_projections) 
+
         embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
@@ -234,17 +266,21 @@ class ClipCaptionModel(nn.Module):
         return out
 
     def __init__(self, prefix_length: int, clip_length: Optional[int] = None, prefix_size: int = 512,
-                 num_layers: int = 8, mapping_type: MappingType = MappingType.MLP):
+                 num_layers: int = 8, mapping_type: MappingType = MappingType.MLP, quantisation : bool = False):
+        
         super(ClipCaptionModel, self).__init__()
         self.prefix_length = prefix_length
         self.gpt = GPT2LMHeadModel.from_pretrained('gpt2')
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
+        self.quantisation = quantisation
         if mapping_type == MappingType.MLP:
             self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
                                      self.gpt_embedding_size * prefix_length))
         else:
             self.clip_project = TransformerMapper(prefix_size, self.gpt_embedding_size, prefix_length,
                                                                      clip_length, num_layers)
+            
+        self.word_mapping = VectorQuantisation(self.gpt.transformer.wte.weight) if self.quantisation else nn.Identity()
 
 
 class ClipCaptionPrefix(ClipCaptionModel):
@@ -349,6 +385,9 @@ def main():
     parser.add_argument('--num_layers', type=int, default=8)
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
+    parser.add_argument('--quantisation', dest='quantisation_prefix', action='store_true')
+    parser.add_argument('--model_path', type=str, default=None)
+
     args = parser.parse_args()
     prefix_length = args.prefix_length
     dataset = ClipCocoDataset(args.data, prefix_length, normalize_prefix=args.normalize_prefix)
@@ -356,13 +395,20 @@ def main():
     args.mapping_type = {'mlp': MappingType.MLP, 'transformer': MappingType.Transformer}[args.mapping_type]
     if args.only_prefix:
         model = ClipCaptionPrefix(prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
-                                  num_layers=args.num_layers, mapping_type=args.mapping_type)
+                                  num_layers=args.num_layers, mapping_type=args.mapping_type, quantisation=args.quantisation_prefix)
         print("Train only prefix")
     else:
         model = ClipCaptionModel(prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
-                                  num_layers=args.num_layers, mapping_type=args.mapping_type)
+                                  num_layers=args.num_layers, mapping_type=args.mapping_type, quantisation=args.quantisation_prefix)
         print("Train both prefix and GPT")
         sys.stdout.flush()
+
+    if os.path.isfile(args.model_path):
+        print(f"loading model from {args.model_path}")
+        model.load_state_dict(torch.load(args.model_path, map_location=torch.device('cpu')))
+    else:
+        print(f"{args.model_path} is not exist, train from scratch")
+
     train(dataset, model, args, output_dir=args.out_dir, output_prefix=args.prefix)
 
 
